@@ -12,15 +12,29 @@ struct CameraView: View {
 
     var body: some View {
         ZStack {
-            // Live camera feed
             CameraPreview(sessionLayer: cameraManager.getPreviewLayer())
                 .ignoresSafeArea()
 
-            // Subtitle overlay at the bottom
             VStack {
+                HStack {
+                    Spacer()
+                    Button {
+                        cameraManager.flipCamera()
+                    } label: {
+                        Image(systemName: "camera.rotate.fill")
+                            .font(.title2)
+                            .foregroundStyle(.white)
+                            .padding(12)
+                            .background(.ultraThinMaterial, in: Circle())
+                    }
+                    .padding(.trailing, 16)
+                    .padding(.top, 12)
+                }
+
                 Spacer()
+
                 Text(cameraManager.subtitleText.isEmpty
-                     ? "Waiting for sign…"
+                     ? " "
                      : cameraManager.subtitleText)
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(.white)
