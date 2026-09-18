@@ -16,15 +16,15 @@ class CameraManager: NSObject, ObservableObject {
     private let videoOutput = AVCaptureVideoDataOutput()
     private var previewLayer: AVCaptureVideoPreviewLayer?
 
-    /// The latest subtitle string from sign detection.
     @Published var subtitleText: String = ""
 
-    // Model expects [150, 3, 21] — 150 frames of 21 hand landmarks with (x, y, confidence)
-    private let frameCount = 150
-    private let jointCount = 21
-    private var poseWindow: [[SIMD3<Float>]] = []  // each entry is 21 joints
-
     private var model: BisindoTranscriber?
+    private let queueSize = 90
+    private var queue = [MLMultiArray]()
+    private var frameCounter = 0
+    private var queueSamplingCounter = 0
+    private let queueSamplingCount = 5
+    private let confidenceThreshold: Double = 0.6
 
     override init() {
         super.init()
@@ -35,10 +35,11 @@ class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    // MARK: - Session
+
+    @Published var cameraPosition: AVCaptureDevice.Position = .back
 
     func startSession() {
-        guard let device = AVCaptureDevice.default(for: .video),
+        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: cameraPosition),
               let input = try? AVCaptureDeviceInput(device: device),
               session.canAddInput(input),
               session.canAddOutput(videoOutput) else { return }
@@ -58,6 +59,27 @@ class CameraManager: NSObject, ObservableObject {
         session.stopRunning()
     }
 
+    func flipCamera() {
+        session.beginConfiguration()
+
+        for input in session.inputs {
+            session.removeInput(input)
+        }
+
+        cameraPosition = (cameraPosition == .back) ? .front : .back
+
+        if let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: cameraPosition),
+           let input = try? AVCaptureDeviceInput(device: device),
+           session.canAddInput(input) {
+            session.addInput(input)
+        }
+
+        session.commitConfiguration()
+
+        queue.removeAll()
+        queueSamplingCounter = 0
+    }
+
     func getPreviewLayer() -> AVCaptureVideoPreviewLayer {
         if let layer = previewLayer { return layer }
         let layer = AVCaptureVideoPreviewLayer(session: session)
@@ -66,39 +88,27 @@ class CameraManager: NSObject, ObservableObject {
         return layer
     }
 
-    // MARK: - Prediction
 
-    private func predict() {
-        guard let model = model else { return }
+    private func getHands(from pixelBuffer: CVPixelBuffer) -> [MLMultiArray] {
+        let request = VNDetectHumanHandPoseRequest()
+        request.maximumHandCount = 2
 
-        // Build MLMultiArray with shape [240, 3, 21]
-        guard let multiArray = try? MLMultiArray(shape: [150, 3, 21], dataType: .float32) else { return }
+        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
+        try? handler.perform([request])
 
-        for (frameIdx, joints) in poseWindow.enumerated() {
-            for (jointIdx, joint) in joints.enumerated() {
-                multiArray[[frameIdx, 0, jointIdx] as [NSNumber]] = NSNumber(value: joint.x)
-                multiArray[[frameIdx, 1, jointIdx] as [NSNumber]] = NSNumber(value: joint.y)
-                multiArray[[frameIdx, 2, jointIdx] as [NSNumber]] = NSNumber(value: joint.z)
+        guard let results = request.results else { return [] }
+
+        var hands = [MLMultiArray]()
+        for observation in results {
+            // Use keypointsMultiArray — gives the exact format the model expects
+            if let keypoints = try? observation.keypointsMultiArray() {
+                hands.append(keypoints)
             }
         }
-
-        do {
-            let input = BisindoTranscriberInput(poses: multiArray)
-            let output = try model.prediction(input: input)
-            let label = output.label
-
-            DispatchQueue.main.async {
-                if !label.isEmpty {
-                    self.subtitleText = label
-                }
-            }
-        } catch {
-            print("Prediction failed: \(error)")
-        }
+        return hands
     }
 }
 
-// MARK: - Process each frame: detect hand pose → accumulate → predict
 
 extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput,
@@ -106,44 +116,32 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate {
                        from connection: AVCaptureConnection) {
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        let request = VNDetectHumanHandPoseRequest()
-        request.maximumHandCount = 1
 
-        let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, options: [:])
-        try? handler.perform([request])
+        let hands = getHands(from: pixelBuffer)
+        guard !hands.isEmpty else { return }
 
-        guard let observation = request.results?.first else {
-            // No hand detected — add a zero frame so timing stays consistent
-            poseWindow.append(Array(repeating: SIMD3<Float>(0, 0, 0), count: jointCount))
-            if poseWindow.count > frameCount { poseWindow.removeFirst() }
-            return
-        }
+        let pose = hands[0]
 
-        // Extract 21 hand joint positions
-        var joints: [SIMD3<Float>] = []
-        let allJoints: [VNHumanHandPoseObservation.JointName] = [
-            .wrist,
-            .thumbCMC, .thumbMP, .thumbIP, .thumbTip,
-            .indexMCP, .indexPIP, .indexDIP, .indexTip,
-            .middleMCP, .middlePIP, .middleDIP, .middleTip,
-            .ringMCP, .ringPIP, .ringDIP, .ringTip,
-            .littleMCP, .littlePIP, .littleDIP, .littleTip
-        ]
+        queue.append(pose)
+        queue = Array(queue.suffix(queueSize))
+        queueSamplingCounter += 1
 
-        for joint in allJoints {
-            if let point = try? observation.recognizedPoint(joint) {
-                joints.append(SIMD3<Float>(Float(point.x), Float(point.y), Float(point.confidence)))
-            } else {
-                joints.append(SIMD3<Float>(0, 0, 0))
+        if queue.count == queueSize && queueSamplingCounter % queueSamplingCount == 0 {
+            let poses = MLMultiArray(concatenating: queue, axis: 0, dataType: .float32)
+
+            do {
+                let prediction = try model?.prediction(poses: poses)
+                guard let label = prediction?.label,
+                      let confidence = prediction?.labelProbabilities[label] else { return }
+
+                if confidence > confidenceThreshold {
+                    DispatchQueue.main.async {
+                        self.subtitleText = label
+                    }
+                }
+            } catch {
+                print("Prediction failed: \(error)")
             }
-        }
-
-        poseWindow.append(joints)
-        if poseWindow.count > frameCount { poseWindow.removeFirst() }
-
-        // Run prediction once we have enough frames
-        if poseWindow.count == frameCount {
-            predict()
         }
     }
 }
